@@ -1,0 +1,9 @@
+device: cuda
+hardware: A6000
+test_path: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS_mc23e_FullSim/timing_samples/jz3_5kevts.root
+checkpoint (part): /storage/agrp/dreyet/f_delphes/cms-flow-evt/saved_models/rcfm_atlas_part_mc23ae_JZ1-9_nsteps10_20260415-T212223/ckpts/rcfm_atlas_part_mc23ae_JZ1-9_nsteps10_20260415-T212223-epoch=76-val_loss_avg=1.3879.ckpt
+checkpoint (evt):  /storage/agrp/dreyet/f_delphes/cms-flow-evt/saved_models/fm_atlas_evt_mc23ae_JZ1-9_nsteps25_20260415-T174030/ckpts/fm_atlas_evt_mc23ae_JZ1-9_nsteps25_20260415-T174030-epoch=144-val_loss_avg=0.5564.ckpt
+n_steps: 50, batch_size: 1024, warmup_batches: 1
+timed batches: 3, events: 3072, elapsed: 65.454 s
+ms/event: 21.307
+events/s: 46.93
