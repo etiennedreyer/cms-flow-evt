@@ -80,7 +80,7 @@ class Set2SetLoss(nn.Module):
 
         return {
             "total_loss": spicy_mat.mean().to(input.device),
-            "pt_loss": spicy_mat_pt.mean(),
-            "eta_loss": spicy_mat_eta.mean(),
-            "phi_loss": spicy_mat_phi.mean(),
+            "pt_loss": spicy_mat_pt.mean().to(input.device),
+            "eta_loss": spicy_mat_eta.mean().to(input.device),
+            "phi_loss": spicy_mat_phi.mean().to(input.device),
         }

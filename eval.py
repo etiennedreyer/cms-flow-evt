@@ -140,6 +140,7 @@ sampler = DPM_Solver(
 )
 
 for i, batch in tqdm(enumerate(loader), total=len(loader)):
+    print(f"Processing batch {i+1}/{len(loader)}")
     truth, truth_mask, global_data = batch
     npf_ext_shape = (truth.shape[0], 4)
     pred = npf_model.sample(

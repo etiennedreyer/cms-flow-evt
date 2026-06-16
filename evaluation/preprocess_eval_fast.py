@@ -17,6 +17,9 @@ from contextlib import contextmanager
 
 from jet_helper import Jet, get_cluster_sequence
 
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from utils.datasetloader import convert_pdgid_to_class, convert_ischarged_to_class
+
 ###  0: charged hadrons
 ###  1: electrons
 ###  2: muons
@@ -73,11 +76,16 @@ def load_file(filename, ttype="jet", entry_start=0, n_events=None, fs=False, df=
             n_events = tree.num_entries
         varlist_ = varlist if not fs else varlist + ["ind"]
         for var in varlist_:
+            if var == "class" and 'truth_class' not in tree.keys():
+                var = "pdgId"
             truth_data[var] = tree[f"truth_{var}"].array(
                 library="np",
                 entry_stop=n_events + entry_start,
                 entry_start=entry_start,
             )
+            if var == "pdgId":
+                truth_data["class"] = convert_pdgid_to_class(truth_data["pdgId"])
+                var = "isCharged"
             if df:
                 pflow_tree = f"fastsim_{var}"
             else:
@@ -87,6 +95,8 @@ def load_file(filename, ttype="jet", entry_start=0, n_events=None, fs=False, df=
                 entry_stop=n_events + entry_start,
                 entry_start=entry_start,
             )
+            if var == "isCharged":
+                pflow_data["class"] = convert_ischarged_to_class(pflow_data["isCharged"])
         event_number = tree["eventNumber"].array(
             library="np",
             entry_stop=n_events + entry_start,
@@ -113,7 +123,7 @@ def find_repeats(arr):
     return {el: np.argwhere(el == arr).flatten() for el in np.unique(arr)}
 
 
-def cluster_jets(pt, eta, phi, jetdef, ptmin=20):
+def cluster_jets(pt, eta, phi, jetdef, ptmin=20, eta_max=2.5, nconstituents_min=2):
     particles = to_ak(pt, eta, phi)
     cs = get_cluster_sequence(
         jetdef, particles, user_indices=list(range(len(particles)))
@@ -121,7 +131,8 @@ def cluster_jets(pt, eta, phi, jetdef, ptmin=20):
     jets = cs.inclusive_jets(ptmin=ptmin)
     jets = fj.sorted_by_pt(jets)
     jets = [Jet(j, 0.5, calc_substructure=True) for j in jets]
-    jets = [j for j in jets if j.nconstituents >= 2]
+    jets = [j for j in jets if j.nconstituents >= nconstituents_min]
+    jets = [j for j in jets if abs(j.eta()) < eta_max]
 
     used_indices = set()
 
@@ -279,12 +290,17 @@ def extract_batch_data(
     fs_data = {key: val[fs_idx] for key, val in fs_data.items()}
     return evt_truth_data, evt_pflow_data, fs_data
 
+def get_duplicate_event_numbers(event_numbers):
+    """Return a set of event numbers that appear more than once."""
+    unique, counts = np.unique(event_numbers, return_counts=True)
+    duplicates = set(unique[counts > 1])
+    return duplicates
 
 def main():
     args = parser.parse_args()
 
     print(f"Loading event file: {args.evt.split('/')[-1]}")
-    _, fs_data, fs_event_number = load_file(args.evt, "evt", fs=not args.dl, df=args.df)
+    tr_fs_data, fs_data, fs_event_number = load_file(args.evt, "evt", fs=not args.dl, df=args.df)
 
     print(f"Loading data file: {'/'.join(args.data.split('/')[-2:])}")
     evt_truth_data, evt_pflow_data, evt_event_number = load_file(
@@ -306,6 +322,28 @@ def main():
         out_data_evt[f"{name}_jet_{var}"] = []
 
     goodEventNumbers = np.intersect1d(evt_event_number, fs_event_number)
+        
+    ### Remove duplicated events completely
+    duplicates = get_duplicate_event_numbers(evt_event_number) | get_duplicate_event_numbers(fs_event_number)
+    if len(duplicates) > 0:
+        print(f"Found {len(duplicates)} duplicated event numbers, removing them")
+        goodEventNumbers = goodEventNumbers[~np.isin(goodEventNumbers, list(duplicates))]
+
+    if args.dl:
+        ### Remove events with matching event number but mismatched truth record
+        bad_events = []
+        for evt_num in tqdm(goodEventNumbers, desc="Checking for mismatched events"):
+            i = np.where(evt_event_number == evt_num)[0][0]
+            j = np.where(fs_event_number == evt_num)[0][0]
+            if evt_event_number[i] == fs_event_number[j]:
+                if tr_fs_data["pt"][j].shape != evt_truth_data["pt"][i].shape:
+                    bad_events.append(evt_event_number[i])
+
+        if len(bad_events) > 0:
+            print(f"Found {len(bad_events)} events with mismatched number of particles, removing them")
+            goodEventNumbers = goodEventNumbers[~np.isin(goodEventNumbers, bad_events)]
+        else:
+            print("No mismatched events found")
 
     if args.n_events > len(goodEventNumbers) or args.n_events == -1:
         args.n_events = len(goodEventNumbers)

@@ -189,6 +189,7 @@ class Attention(nn.Module):
             self.attn_fn = torch_attn
         self.do_selfattn = do_selfattn
         self.do_qk_norm = do_qk_norm
+        self.do_v_norm = False
 
         # Attributes
         self.embed_dim = embed_dim

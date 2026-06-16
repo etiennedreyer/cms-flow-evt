@@ -8,6 +8,9 @@ import torch.nn.functional as F
 import uproot
 from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
+from utils.pdgid import pdgid_class_dict
+import os
+from glob import glob
 
 ###  0: charged hadrons
 ###  1: electrons
@@ -16,6 +19,24 @@ from tqdm import tqdm
 ###  4: photons
 ###  5: residual
 ### -1: neutrinos
+
+def convert_pdgid_to_class(pdgid_arr):
+    from utils.pdgid import pdgid_class_dict
+    _vectorized = np.vectorize(pdgid_class_dict.get, otypes=[object])
+    class_arr = np.array(
+        [_vectorized(pdgid) for pdgid in pdgid_arr],
+        dtype=object
+    )
+    return class_arr
+
+def convert_ischarged_to_class(ischarged_arr, neut_class=4):
+    assert np.isin(np.concatenate(ischarged_arr), [0, 1]).all(), \
+        "IsCharged array should only contain 0 or 1"
+    class_arr = np.array(
+        [(1 - charge)*neut_class for charge in ischarged_arr],
+        dtype=object
+    )
+    return class_arr
 
 
 class VarTransform:
@@ -111,13 +132,28 @@ class FastSimDataset(Dataset):
 
         self.zero_neutral_vtx = self.config.get("zero_neutral_vtx", False)
 
-        self.file = uproot.open(filename, num_workers=6)
-        self.tree = self.file[f"evt_tree"]
+        if os.path.isdir(filename):
+            filename = os.path.join(filename, "*.root")
+        if ('*' in filename):
+            filenames = sorted(glob(filename))
+            if not filenames:
+                raise ValueError(f"No files found matching: {filename}")
+        else:
+            filenames = [filename]
+
+        self.tree_name = 'evt_tree'
+        self.file = uproot.open(filenames[0], num_workers=6)
+        self.tree = self.file[self.tree_name]
+        self.uproot_sources = [f"{p}:{self.tree_name}" for p in filenames]
 
         self.max_particles = self.config["max_particles"]
 
         self.entry_start = entry_start
         self.nevents = self.tree.num_entries
+        if len(filenames) > 1:
+            for p in filenames[1:]:
+                with uproot.open(p) as _f:
+                    self.nevents += _f[self.tree_name].num_entries
         if reduce_ds < 1.0 and reduce_ds > 0:
             self.nevents = int(self.nevents * reduce_ds)
         if reduce_ds >= 1.0:
@@ -142,11 +178,7 @@ class FastSimDataset(Dataset):
                     ] = 0
 
         self.full_data_array["eventNumber"] = torch.tensor(
-            self.tree["eventNumber"].array(
-                library="np",
-                entry_stop=self.nevents + self.entry_start,
-                entry_start=self.entry_start,
-            )[self.n_particle_mask]
+            self._read_branch("eventNumber")[self.n_particle_mask]
         )
 
         self.n_truth_particles = self.n_truth_particles[self.n_particle_mask]
@@ -174,6 +206,22 @@ class FastSimDataset(Dataset):
 
         self._calculate_mean_std()
         self._get_scaled_global_data()
+
+    def _read_branch(self, var):
+        if len(self.uproot_sources) == 1:
+            return self.tree[var].array(
+                library="np",
+                entry_start=self.entry_start,
+                entry_stop=self.entry_start + self.nevents,
+            )
+        else:
+            arrays = []
+            for src in self.uproot_sources:
+                path, tree_name = src.rsplit(":", 1)
+                with uproot.open(path) as f:
+                    arrays.append(f[tree_name][var].array(library="np"))
+            arr = np.concatenate(arrays)
+            return arr[self.entry_start : self.entry_start + self.nevents]
 
     def _calculate_mean_std(self):
         self.truth_vars_shift_scales = {
@@ -250,6 +298,8 @@ class FastSimDataset(Dataset):
                 value = value[self.n_particle_mask]
             if "ht" not in var and "met" not in var and "_class_" not in var:
                 value = np.concatenate(value)
+                if value.dtype == object:
+                    value = np.array([np.array(x) for x in value])
             value = torch.tensor(value)
             if "eta" in var:
                 value = torch.clamp(value, -3, 3)
@@ -260,11 +310,12 @@ class FastSimDataset(Dataset):
     def _load_truth(self):
         self.truth_variables = [el for el in self.config["truth_variables"]]
 
-        self.n_truth_particles = self.tree["ntruth"].array(
-            library="np",
-            entry_stop=self.nevents + self.entry_start,
-            entry_start=self.entry_start,
-        )
+        if "ntruth" in self.tree:
+            self.n_truth_particles = self._read_branch("ntruth")
+        else:
+            truth_pdgId = self._read_branch('truth_pdgId')
+            self.n_truth_particles = np.array([len(pdgids) for pdgids in truth_pdgId])
+            
         if self.n_particle_mask is None:
             self.n_particle_mask = self.n_truth_particles < self.max_particles
         else:
@@ -273,11 +324,15 @@ class FastSimDataset(Dataset):
             )
 
         for var in tqdm(self.truth_variables):
-            self.full_data_array[var] = self.tree[var].array(
-                library="np",
-                entry_stop=self.nevents + self.entry_start,
-                entry_start=self.entry_start,
-            )
+
+            if var=="truth_class" and "truth_class" not in self.tree:
+                if 'truth_pdgId' not in self.tree:
+                    raise ValueError("Neither truth_class nor truth_pdgId in tree!")
+
+                var = "truth_pdgId"
+
+            self.full_data_array[var] = self._read_branch(var)
+
             if var == "truth_pt":
                 self.full_data_array["truth_ht"] = np.array(
                     [x.sum() for x in self.full_data_array[var]]
@@ -285,7 +340,9 @@ class FastSimDataset(Dataset):
                 self.full_data_array["truth_ptrel"] = np.array(
                     [x / x.sum() for x in self.full_data_array[var]], dtype=object
                 )
-
+            elif var == "truth_pdgId":
+                self.full_data_array["truth_class"] = \
+                    convert_pdgid_to_class(self.full_data_array[var])
         for i, var in enumerate(self.truth_variables):
             if var == "truth_pt":
                 self.truth_variables[i] = "truth_ptrel"
@@ -308,11 +365,11 @@ class FastSimDataset(Dataset):
     def _load_pflow(self):
         self.pflow_variables = [el for el in self.config["pflow_variables"]]
 
-        self.n_pflow_particles = self.tree["npflow"].array(
-            library="np",
-            entry_stop=self.nevents + self.entry_start,
-            entry_start=self.entry_start,
-        )
+        if "npflow" in self.tree:
+            self.n_pflow_particles = self._read_branch("npflow")
+        else:
+            temp_feat = self._read_branch(self.pflow_variables[0])
+            self.n_pflow_particles = np.array([len(x) for x in temp_feat])
         if self.n_particle_mask is None:
             self.n_particle_mask = (self.n_pflow_particles < self.max_particles) & (
                 self.n_pflow_particles > 0
@@ -325,11 +382,14 @@ class FastSimDataset(Dataset):
             )
 
         for var in tqdm(self.pflow_variables):
-            self.full_data_array[var] = self.tree[var].array(
-                library="np",
-                entry_stop=self.nevents + self.entry_start,
-                entry_start=self.entry_start,
-            )
+            
+            if var=="pflow_class" and "pflow_class" not in self.tree:
+                if 'pflow_pdgId' not in self.tree:
+                    raise ValueError("Neither pflow_class nor pflow_pdgId not in tree!")
+
+                var = "pflow_isCharged"
+
+            self.full_data_array[var] = self._read_branch(var)
             if var == "pflow_pt":
                 self.full_data_array["pflow_ht"] = np.array(
                     [x.sum() for x in self.full_data_array[var]]
@@ -337,6 +397,12 @@ class FastSimDataset(Dataset):
                 self.full_data_array["pflow_ptrel"] = np.array(
                     [x / x.sum() for x in self.full_data_array[var]], dtype=object
                 )
+            elif var == "pflow_isCharged":
+                print("Warning: infering pflow_class from pflow_isCharged, "
+                      "make sure this is what you want! True (charged) -> 0, False (neutral) -> 4")
+                self.full_data_array["pflow_class"] = \
+                    convert_ischarged_to_class(self.full_data_array[var])
+            
         for i, var in enumerate(self.pflow_variables):
             if var == "pflow_pt":
                 self.pflow_variables[i] = "pflow_ptrel"

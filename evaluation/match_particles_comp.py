@@ -58,13 +58,33 @@ def get_common_events(data_dict):
     return goodEvents
 
 
-def filter_events(data_dict, n_events=None):
-    goodEvents = get_common_events(data_dict)[:n_events]
+def get_common_event_numbers(samples_path_dict, tree="evt_tree"):
+    """Read eventNumber from every ROOT file across all samples and return the intersection."""
+    all_event_sets = []
+    for sample, path_dict in samples_path_dict.items():
+        for key, filepath in path_dict.items():
+            with uproot.open(filepath) as f:
+                evtnums = f[tree]["eventNumber"].array(library="np").astype(int)
+                all_event_sets.append(set(evtnums))
+                print(f"  {key} ({sample}): {len(evtnums)} events")
+    common = set.intersection(*all_event_sets)
+    common = np.array(sorted(common), dtype=int)
+    print(f"Common events across all samples: {len(common)}")
+    return common
+
+
+def filter_events(data_dict, n_events=None, common_events=None):
+    if common_events is not None:
+        goodEvents = common_events[:n_events] if n_events else common_events
+    else:
+        goodEvents = get_common_events(data_dict)[:n_events]
     for key in data_dict.keys():
         idx_sorted = np.argsort(data_dict[key]["eventNumber"])
-        idxs = np.argwhere(
-            np.isin(data_dict[key]["eventNumber"][idx_sorted], goodEvents)
-        ).flatten()
+        sorted_evtnums = data_dict[key]["eventNumber"][idx_sorted]
+        mask = np.isin(sorted_evtnums, goodEvents)
+        # Deduplicate: keep only the first occurrence of each eventNumber
+        _, first_occ = np.unique(sorted_evtnums[mask], return_index=True)
+        idxs = np.where(mask)[0][first_occ]
         for constituent in ["pflow", "fastsim", "truth"]:
             if constituent not in data_dict[key]:
                 continue
@@ -114,6 +134,7 @@ def reshape_phi(phi):
 def load_sample(
     path_dict: dict,
     n_events: int = None,
+    common_events: np.ndarray = None,
 ):
     data_dict = {}
     data_dict_all = {}
@@ -127,7 +148,7 @@ def load_sample(
             value, entry_stop=n_events, load_cms=True # if key == "dl" else False
         )
         # zero_neutral_vtx(data_dict[key])
-    filter_events(data_dict, n_events=n_events)
+    filter_events(data_dict, n_events=n_events, common_events=common_events)
     for i, key in enumerate(data_dict.keys()):
         data_dict_jet[key] = extract_jet_bkg(data_dict[key], data_type="jet")
         data_dict_bkg[key] = extract_jet_bkg(data_dict[key], data_type="bkg")
@@ -150,7 +171,10 @@ def mse(a, b):
     return (a - b) ** 2
 
 
-def process_event(input_eta, input_phi, truth_eta, truth_phi, dr_cut=0.6):
+def process_event(input_eta, input_phi, input_class, 
+                  truth_eta, truth_phi, truth_class, 
+                  dr_cut=0.4, match_charge=True):
+
     truth_eta = np.tile(
         np.expand_dims(truth_eta, axis=1), (1, len(input_eta))
     )  # row content same
@@ -165,6 +189,16 @@ def process_event(input_eta, input_phi, truth_eta, truth_phi, dr_cut=0.6):
         np.expand_dims(input_phi, axis=0), (len(truth_phi), 1)
     )  # column content same
 
+    if match_charge:
+        assert input_class is not None and truth_class is not None, \
+            "input_class and truth_class must be provided when match_charge is True"
+        truth_class = np.tile(
+            np.expand_dims(truth_class, axis=1), (1, len(input_class))
+        )  # row content same
+        input_class = np.tile(
+            np.expand_dims(input_class, axis=0), (len(truth_class), 1)
+        )  # column content same
+
     # loss_phi = mse(truth_phi, input_phi)
     # loss_eta = mse(truth_eta, input_eta)
     loss_phi = np.pow(reshape_phi(truth_phi - input_phi), 2)
@@ -175,17 +209,21 @@ def process_event(input_eta, input_phi, truth_eta, truth_phi, dr_cut=0.6):
     loss_hung = loss.copy()
 
     dr = np.sqrt(loss_eta + loss_phi)
-    loss[dr > dr_cut] = 1e3
+    is_valid_mask = dr <= dr_cut
 
-    loss[loss == np.inf] = 1000
-    loss[loss == np.nan] = 1000
+    if match_charge:
+        input_is_charged = input_class < 3
+        truth_is_charged = truth_class < 3
+        is_valid_mask &= (input_is_charged == truth_is_charged)
+
+    loss[~is_valid_mask] = 1e3
+    loss[loss == np.inf] = 1e3
+    loss[loss == np.nan] = 1e3
+
     truth_ix, input_ix = linear_sum_assignment(loss)
 
-    # Create boolean mask for dr < 0.6
-    mask = dr <= dr_cut
-
-    # Find all pairs (i, j) where dr < 0.6
-    filtered_pairs = np.argwhere(mask)
+    # Find all valid pairs (i, j)
+    filtered_pairs = np.argwhere(is_valid_mask)
 
     # Convert truth_ix and input_ix into sets for fast lookups
     truth_input_pairs = set(zip(truth_ix, input_ix))
@@ -214,18 +252,25 @@ def process_event(input_eta, input_phi, truth_eta, truth_phi, dr_cut=0.6):
         hung_cost = loss_extract.mean()
     if len(input_ix) > 0:
         assert np.max(input_ix) < input_eta.shape[-1], (
-            f"{mask.shape=} {input_ix=} {len(input_eta)=}"
+            f"{is_valid_mask.shape=} {input_ix=} {len(input_eta)=}"
         )
     if len(truth_ix) > 0:
         assert np.max(truth_ix) < truth_eta.shape[0], (
-            f"{mask.shape=} {truth_ix=} {len(truth_eta)=}"
+            f"{is_valid_mask.shape=} {truth_ix=} {len(truth_eta)=}"
         )
 
     return input_ix, truth_ix, hung_cost
 
 
 def process_batch(data):
-    input_eta, input_phi, truth_eta, truth_phi, dr_cut = data
+    if len(data) == 6:
+        input_eta, input_phi, input_class, truth_eta, truth_phi, truth_class = data
+    elif len(data) == 4:
+        input_eta, input_phi, truth_eta, truth_phi = data
+        input_class = None
+        truth_class = None
+    else:
+        raise ValueError(f"Expected data length of 4 or 6, got {len(data)}")
 
     input_indices = []
     truth_indices = []
@@ -235,12 +280,15 @@ def process_batch(data):
     for i in range(len(input_eta)):
         input_eta_i = input_eta[i]
         input_phi_i = reshape_phi(input_phi[i])
+        input_class_i = input_class[i] if input_class is not None else None
 
         truth_eta_i = truth_eta[i]
         truth_phi_i = reshape_phi(truth_phi[i])
+        truth_class_i = truth_class[i] if truth_class is not None else None
 
         input_ix, truth_ix, hung_cost[i] = process_event(
-            input_eta_i, input_phi_i, truth_eta_i, truth_phi_i, dr_cut=dr_cut
+            input_eta_i, input_phi_i, input_class_i, 
+            truth_eta_i, truth_phi_i, truth_class_i,
         )
 
         input_indices.append(input_ix)
@@ -249,12 +297,14 @@ def process_batch(data):
     return input_indices, truth_indices, hung_cost
 
 
-def matching_dr(input_data, truth_data, dr_cut=0.6, batch_size=500):
+def matching_dr(input_data, truth_data, batch_size=500):
     input_eta = input_data["eta"]
     input_phi = input_data["phi"]
+    input_class = input_data["class"]
 
     truth_eta = truth_data["eta"]
     truth_phi = truth_data["phi"]
+    truth_class = truth_data["class"]
 
     input_indices = []
     truth_indices = []
@@ -265,7 +315,8 @@ def matching_dr(input_data, truth_data, dr_cut=0.6, batch_size=500):
 
     batches = np.array_split(np.arange(len(input_eta)), n_batches)
     batched_data = [
-        (input_eta[batch], input_phi[batch], truth_eta[batch], truth_phi[batch], dr_cut)
+        (input_eta[batch], input_phi[batch], input_class[batch], 
+         truth_eta[batch], truth_phi[batch], truth_class[batch])
         for batch in batches
     ]
 
@@ -289,27 +340,34 @@ def matching_dr(input_data, truth_data, dr_cut=0.6, batch_size=500):
 def main():
     # Deep5M + SinCos + DPM++ + EtaEval 2.5 cut
     samples_path_dict = {
-        # "JZ3456": {
-        #     "fm25_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_rcfm_atlas_part_JZ3456_84_25_45k_test_eta25Eval.root"
-        # }
-        # "JZall": {
-        #     "fm25_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_rcfm_atlas_part_JZall_65_25_154k_test_eta25Eval.root"
-        # },
-        "JZ7-8": {
-            # "fm25_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_rcfm_atlas_part_JZ7-8_65_25_19k_test_eta25Eval.root"
-            "fm25_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_rcfm_atlas_part_JZ78_196_25_19k_test_eta25Eval.root"
+        "JZall": {
+            # "fm25_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_rcfm_atlas_part_JZall_65_25_154k_test_eta25Eval.root"
+            # "fm25_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_JZ4_FullSim_rcfm_atlas_part_JZall_54_25_10k_test_eta25Eval.root",
+            # "fm25_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_mc23e_test_JZ1-9_hamza_atlas_part_nsteps25_large_54_25_75k_test_eta25Eval.root",
+            # "fm50_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_mc23e_test_JZ1-9_hamza_atlas_part_nsteps50_large_54_50_75k_test_eta25Eval.root",
+            # "fm50_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_76k_test_eta25Eval.root", 
+            # "fm50_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_74k_test_eta25Eval.root",
+            "fm50_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_74k_test_eta27Eval.root",
+            # "fm50_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps10_76_50_76k_test_eta25Eval.root",
+            # "dl_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_JZ4_AF3_atlas_10k_test_eta25Eval.root"
+            # "dl_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_test_JZ1-9_hamza_AF3_37k_test_eta25Eval.root",
+            # "dl_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_test_JZ1-9_AF3_76k_test_eta25Eval.root"
+            # "dl_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_test_JZ1-9_AF3_new_58k_test_eta25Eval.root",
+            # "dl_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_test_JZ1-9_AF3_bugfix_58k_test_eta25Eval.root",
+            "dl_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_test_JZ1-9_AF3_bugfix_58k_test_eta27Eval.root",
         },
-        # "JZ3-6": {
-        #     "fm25_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_rcfm_atlas_part_JZ3-6_65_25_45k_test_eta25Eval.root"
-        # }
-        # "JZ1-2": {
-        #     "fm25_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_rcfm_atlas_part_JZ1-2_65_25_99k_test_eta25Eval.root"
+        # "WprimeWZ": {
+        #     "fm50_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_mc23e_test_WprimeWZ_00000x_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps10_76_50_44k_test_eta25Eval.root",
+        #     "dl_path": "/storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/eval_test_WprimeWZ_AF3_49k_test_eta25Eval.root",
         # }
     }
+    print("Finding common events across all samples...")
+    common_events = get_common_event_numbers(samples_path_dict)
+
     samples_data = {}
     for sample, value in samples_path_dict.items():
         print(f"Loading {sample} sample")
-        all_data, jet_data, bkg_data = load_sample(value)
+        all_data, jet_data, bkg_data = load_sample(value, common_events=common_events)
         samples_data[sample] = {"all": all_data, "jet": jet_data, "bkg": bkg_data}
 
     particle_matching_dicts = {key: {} for key in samples_data.keys()}
@@ -324,7 +382,6 @@ def main():
             particle_matching_dicts[sample][key] = matching_dr(
                 samples_data[sample]["all"][key],
                 samples_data[sample]["all"]["tr"],
-                dr_cut=0.6,
             )
     print("Matching jet particles")
     for sample in samples_data.keys():
@@ -333,7 +390,6 @@ def main():
             particle_matching_dicts_jet[sample][key] = matching_dr(
                 samples_data[sample]["jet"][key],
                 samples_data[sample]["jet"]["tr"],
-                dr_cut=0.6,
             )
 
     print("Matching bkg particles")
@@ -343,16 +399,23 @@ def main():
             particle_matching_dicts_bkg[sample][key] = matching_dr(
                 samples_data[sample]["bkg"][key],
                 samples_data[sample]["bkg"]["tr"],
-                dr_cut=0.6,
             )
 
     with open(
         # "evals/rcfm_atlas_part_JZ3456_84_25_45k_test_eta25Eval_particle_matching_dicts_all.pkl",
         # "evals/rcfm_atlas_part_JZall_65_25_154k_test_eta25Eval_particle_matching_dicts_all.pkl",
         # "evals/rcfm_atlas_part_JZ7-8_65_25_19k_test_eta25Eval_particle_matching_dicts_all.pkl",
-        "evals/rcfm_atlas_part_JZ78_196_25_19k_test_eta25Eval_particle_matching_dicts_all.pkl",
+        # "evals/rcfm_atlas_part_JZ78_196_25_19k_test_eta25Eval_particle_matching_dicts_all.pkl",
         # "evals/rcfm_atlas_part_JZ1-2_65_25_99k_test_eta25Eval_particle_matching_dicts_all.pkl",
         # "evals/rcfm_atlas_part_JZ3-6_65_25_45k_test_eta25Eval_particle_matching_dicts_all.pkl",
+        # "evals/rcfm_atlas_part_JZall_65_25_154k_test_eta25Eval_particle_matching_dicts_all_08042026.pkl",
+        # "evals/all_eval_mc23e_test_JZ1-9_hamza_atlas_part_nsteps25_large_54_25_75k_test_eta25Eval.root",
+        # "evals/all_eval_mc23e_test_JZ1-9_hamza_atlas_part_nsteps50_large_54_50_75k_test_eta25Eval.root",
+        # "evals/all_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_76k_test_eta25Eval.root",
+        # "evals/all_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_bugfix_58k_test_eta25Eval.root",
+        "evals/all_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_bugfix_58k_test_eta27Eval.root",
+        # "evals/all_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps10_76_50_76k_test_eta25Eval.root",
+        # "evals/all_eval_mc23e_test_WprimeWZ_00000x_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps10_76_50_44k_test_eta25Eval.root",
         "wb",
     ) as f:
         pickle.dump(particle_matching_dicts, f)
@@ -360,9 +423,17 @@ def main():
         # "evals/rcfm_atlas_part_JZ3456_84_25_45k_test_eta25Eval_particle_matching_dicts_jet.pkl",
         # "evals/rcfm_atlas_part_JZall_65_25_154k_test_eta25Eval_particle_matching_dicts_jet.pkl",
         # "evals/rcfm_atlas_part_JZ7-8_65_25_19k_test_eta25Eval_particle_matching_dicts_jet.pkl",
-        "evals/rcfm_atlas_part_JZ78_196_25_19k_test_eta25Eval_particle_matching_dicts_jet.pkl",
+        # "evals/rcfm_atlas_part_JZ78_196_25_19k_test_eta25Eval_particle_matching_dicts_jet.pkl",
         # "evals/rcfm_atlas_part_JZ1-2_65_25_99k_test_eta25Eval_particle_matching_dicts_jet.pkl",
         # "evals/rcfm_atlas_part_JZ3-6_65_25_45k_test_eta25Eval_particle_matching_dicts_jet.pkl",
+        # "evals/rcfm_atlas_part_JZall_65_25_154k_test_eta25Eval_particle_matching_dicts_jet_08042026.pkl",
+        # "evals/jet_eval_mc23e_test_JZ1-9_hamza_atlas_part_nsteps25_large_54_25_75k_test_eta25Eval_jet.pkl",
+        # "evals/jet_eval_mc23e_test_JZ1-9_hamza_atlas_part_nsteps50_large_54_50_75k_test_eta25Eval_jet.pkl",
+        # "evals/jet_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_76k_test_eta25Eval_jet.pkl",
+        # "evals/jet_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_bugfix_58k_test_eta25Eval_jet.pkl",
+        "evals/jet_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_bugfix_58k_test_eta27Eval_jet.pkl",
+        # "evals/jet_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps10_76_50_76k_test_eta25Eval_jet.pkl",
+        # "evals/jet_eval_mc23e_test_WprimeWZ_00000x_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps10_76_50_44k_test_eta25Eval_jet.pkl",
         "wb",
     ) as f:
         pickle.dump(particle_matching_dicts_jet, f)
@@ -370,9 +441,17 @@ def main():
         # "evals/rcfm_atlas_part_JZ3456_84_25_45k_test_eta25Eval_particle_matching_dicts_bkg.pkl",
         # "evals/rcfm_atlas_part_JZall_65_25_154k_test_eta25Eval_particle_matching_dicts_bkg.pkl",
         # "evals/rcfm_atlas_part_JZ7-8_65_25_19k_test_eta25Eval_particle_matching_dicts_bkg.pkl",
-        "evals/rcfm_atlas_part_JZ78_196_25_19k_test_eta25Eval_particle_matching_dicts_bkg.pkl",
+        # "evals/rcfm_atlas_part_JZ78_196_25_19k_test_eta25Eval_particle_matching_dicts_bkg.pkl",
         # "evals/rcfm_atlas_part_JZ1-2_65_25_99k_test_eta25Eval_particle_matching_dicts_bkg.pkl",
         # "evals/rcfm_atlas_part_JZ3-6_65_25_45k_test_eta25Eval_particle_matching_dicts_bkg.pkl",
+        # "evals/rcfm_atlas_part_JZall_65_25_154k_test_eta25Eval_particle_matching_dicts_bkg_08042026.pkl",
+        # "evals/bkg_eval_mc23e_test_JZ1-9_hamza_atlas_part_nsteps25_large_54_25_75k_test_eta25Eval_bkg.pkl",
+        # "evals/bkg_eval_mc23e_test_JZ1-9_hamza_atlas_part_nsteps50_large_54_50_75k_test_eta25Eval_bkg.pkl",
+        # "evals/bkg_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_76k_test_eta25Eval_bkg.pkl",
+        # "evals/bkg_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_bugfix_58k_test_eta25Eval_bkg.pkl",
+        "evals/bkg_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps25_75_50_bugfix_58k_test_eta27Eval_bkg.pkl",
+        # "evals/bkg_eval_mc23e_test_JZ1-9_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps10_76_50_76k_test_eta25Eval_bkg.pkl",
+        # "evals/bkg_eval_mc23e_test_WprimeWZ_00000x_FullSim_50steps_rcfm_atlas_part_mc23ae_JZ1-9_nsteps10_76_50_44k_test_eta25Eval_bkg.pkl",
         "wb",
     ) as f:
         pickle.dump(particle_matching_dicts_bkg, f)

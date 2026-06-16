@@ -1,4 +1,4 @@
-name: fm_atlas_pow_evt_net_JZ78
+name: fm_atlas_evt_mc23ae_JZ1-9_nsteps25
 sigma: 0.0001
 n_steps: 25
 train_type: evt
@@ -17,15 +17,15 @@ truth_binary_class: false
 
 reduce_ds_train: -1
 reduce_ds_valid: -1
-eval_num_events: 10000
+eval_num_events: 40960
 
 entry_start_train: 0
 entry_start_valid: 0
 entry_start_test: 0
 
-num_workers: 6
+num_workers: 12
 batchsize: 128
-val_batchsize: 5000
+val_batchsize: 4096
 
 eval_dir: /storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/
 # truth_path_train: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/train_JZ3-6.root # 370k events
@@ -34,9 +34,12 @@ eval_dir: /storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/
 # truth_path_train: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/train_JZ1-8.root # 1.3M events
 # truth_path_valid: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/val_JZ1-8.root   #  138k events
 # truth_path_test:  /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/test_JZ1-8.root  #  170k events
-truth_path_train: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/train_JZ7-8.root #  140k events
-truth_path_valid: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/val_JZ7-8.root   #  9500 events
-truth_path_test:  /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/test_JZ7-8.root  #  20k events
+# truth_path_train: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/train_JZ7-8.root #  140k events
+# truth_path_valid: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/val_JZ7-8.root   #  9500 events
+# truth_path_test:  /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/test_JZ7-8.root  #  20k events
+truth_path_train: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS_mc23a_mc23e_train_val/train_mc23a_mc23e_JZ1-9.root
+truth_path_valid: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS_mc23a_mc23e_train_val/val_mc23a_mc23e_JZ1-9.root
+truth_path_test: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS_mc23e_FullSim/hamza_samples/test_JZ1-9.root
 
 max_particles: 500
 time_pow: true
@@ -48,7 +51,7 @@ n_res_blocks: 3
 
 act: gelu
 
-var_transform: !include var_transform_ttbar_qcd.yaml
+var_transform: !include var_transform_qcd_ATLAS.yaml
 
 truth_variables:
     - truth_pt

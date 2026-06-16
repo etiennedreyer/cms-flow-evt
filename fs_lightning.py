@@ -155,6 +155,9 @@ class FlowLightning(LightningModule):
 
         self.comet_logger = comet_logger
 
+        self.val_sample_every_n_epoch = config.get("val_sample_every_n_epoch", 5)
+        self.eval_num_events = config.get("eval_num_events", -1)
+
         self.validation_step_outputs = []
 
     def set_comet_logger(self, comet_logger):
@@ -218,23 +221,6 @@ class FlowLightning(LightningModule):
         truth, pflow, mask, global_data = data
         return_dict = {}
         return_dict["val_loss"] = loss
-        with torch.no_grad():
-            pred = self.sample(
-                truth,
-                pflow.shape,
-                mask,
-                global_data=global_data,
-            )
-            fs_mask = mask[..., 1].bool()
-            pred_loss = self.get_pred_loss(pred, pflow, mask=mask)
-            for key, val in pred_loss.items():
-                self.log(
-                    f"pred_{key}",
-                    val,
-                    batch_size=data[0].shape[0],
-                    sync_dist=True,
-                )
-                return_dict[f"pred_{key}"] = val
         self.log(
             "val_loss",
             loss,
@@ -242,64 +228,91 @@ class FlowLightning(LightningModule):
             sync_dist=True,
         )
 
-        return_dict["truth"] = truth.cpu()
-        return_dict["pflow"] = pflow.cpu()
-        return_dict["mask"] = mask.cpu()
-        return_dict["global_data"] = global_data.cpu()
-        return_dict["fs"] = pred.cpu()
-        return_dict["fs_mask"] = fs_mask.cpu()
+        # Only run expensive sampling + set2set loss every N epochs,
+        # and only for the first eval_num_events events
+        is_sample_epoch = self.current_epoch % self.val_sample_every_n_epoch == 0
+        bs = data[0].shape[0]
+        events_so_far = batch_idx * bs
+        under_eval_limit = self.eval_num_events < 0 or events_so_far < self.eval_num_events
+        if is_sample_epoch and under_eval_limit:
+            with torch.no_grad():
+                pred = self.sample(
+                    truth,
+                    pflow.shape,
+                    mask,
+                    global_data=global_data,
+                )
+                fs_mask = mask[..., 1].bool()
+                pred_loss = self.get_pred_loss(pred, pflow, mask=mask)
+                for key, val in pred_loss.items():
+                    self.log(
+                        f"pred_{key}",
+                        val,
+                        batch_size=data[0].shape[0],
+                        sync_dist=True,
+                    )
+                    return_dict[f"pred_{key}"] = val
+
+            return_dict["truth"] = truth.cpu()
+            return_dict["pflow"] = pflow.cpu()
+            return_dict["mask"] = mask.cpu()
+            return_dict["global_data"] = global_data.cpu()
+            return_dict["fs"] = pred.cpu()
+            return_dict["fs_mask"] = fs_mask.cpu()
 
         self.validation_step_outputs.append(return_dict)
 
     def on_train_epoch_end(self):
         if self.config["lr_scheduler"] is not False:
-            self.log("lr", self.lr_schedulers().get_last_lr()[0], sync_dist=True)
+            self.log("lr", self.lr_schedulers().get_last_lr()[0])
             self.lr_schedulers().step(epoch=self.current_epoch)
 
     def on_validation_epoch_end(self):
         outputs = self.validation_step_outputs
         avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
         self.log("val_loss_avg", avg_loss, sync_dist=True)
-        if self.current_epoch % 5 == 0:
-            avg_pred_loss = torch.stack([x["pred_total_loss"] for x in outputs]).mean()
-            self.log("pred_loss_avg", avg_pred_loss, sync_dist=True)
         if self.config["lr_scheduler"] is not False:
-            self.log("lr", self.lr_schedulers().get_last_lr()[0], sync_dist=True)
+            self.log("lr", self.lr_schedulers().get_last_lr()[0])
 
-        truth = torch.cat([x["truth"] for x in outputs], dim=0)
-        pflow = torch.cat([x["pflow"] for x in outputs], dim=0)
-        mask = torch.cat([x["mask"] for x in outputs], dim=0)
-        global_data = torch.cat([x["global_data"] for x in outputs], dim=0)
-        fs = torch.cat([x["fs"] for x in outputs], dim=0)
-        fs_mask = torch.cat([x["fs_mask"] for x in outputs], dim=0)
+        if self.current_epoch % self.val_sample_every_n_epoch == 0:
+            sampled_outputs = [x for x in outputs if "pred_total_loss" in x]
+            avg_pred_loss = torch.stack([x["pred_total_loss"] for x in sampled_outputs]).mean()
+            self.log("pred_loss_avg", avg_pred_loss, sync_dist=True)
 
-        truth = torch.cat(
-            [
-                truth[..., :2],
-                torch.atan2(truth[..., 2], truth[..., 3]).unsqueeze(-1) / 1.814,
-                truth[..., 4:],
-            ],
-            dim=-1,
-        )
-        pflow = torch.cat(
-            [
-                pflow[..., :2],
-                torch.atan2(pflow[..., 2], pflow[..., 3]).unsqueeze(-1) / 1.814,
-                pflow[..., 4:],
-            ],
-            dim=-1,
-        )
-        fs = torch.cat(
-            [
-                fs[..., :2],
-                torch.atan2(fs[..., 2], fs[..., 3]).unsqueeze(-1) / 1.814,
-                fs[..., 4:],
-            ],
-            dim=-1,
-        )
+            truth = torch.cat([x["truth"] for x in sampled_outputs], dim=0)
+            pflow = torch.cat([x["pflow"] for x in sampled_outputs], dim=0)
+            mask = torch.cat([x["mask"] for x in sampled_outputs], dim=0)
+            global_data = torch.cat([x["global_data"] for x in sampled_outputs], dim=0)
+            fs = torch.cat([x["fs"] for x in sampled_outputs], dim=0)
+            fs_mask = torch.cat([x["fs_mask"] for x in sampled_outputs], dim=0)
 
-        val_jet_pt_mse = self.log_image(truth, pflow, mask, global_data, fs, fs_mask)
-        self.log("val_jet_pt_mse", val_jet_pt_mse, sync_dist=True)
+            truth = torch.cat(
+                [
+                    truth[..., :2],
+                    torch.atan2(truth[..., 2], truth[..., 3]).unsqueeze(-1) / 1.814,
+                    truth[..., 4:],
+                ],
+                dim=-1,
+            )
+            pflow = torch.cat(
+                [
+                    pflow[..., :2],
+                    torch.atan2(pflow[..., 2], pflow[..., 3]).unsqueeze(-1) / 1.814,
+                    pflow[..., 4:],
+                ],
+                dim=-1,
+            )
+            fs = torch.cat(
+                [
+                    fs[..., :2],
+                    torch.atan2(fs[..., 2], fs[..., 3]).unsqueeze(-1) / 1.814,
+                    fs[..., 4:],
+                ],
+                dim=-1,
+            )
+
+            val_jet_pt_mse = self.log_image(truth, pflow, mask, global_data, fs, fs_mask)
+            self.log("val_jet_pt_mse", torch.tensor(val_jet_pt_mse, device=self.device), sync_dist=True)
 
         self.validation_step_outputs.clear()
 
@@ -372,7 +385,7 @@ class FlowLightning(LightningModule):
             batch_size=self.config.get("val_batchsize", self.config["batchsize"]),
             drop_last=True,
             pin_memory=False,
-            shuffle=False,
+            shuffle=(self.eval_num_events > 0),
         )
         return loader
 

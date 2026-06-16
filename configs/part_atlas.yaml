@@ -1,12 +1,12 @@
-name: rcfm_atlas_part_JZ78
+name: rcfm_atlas_part_mc23ae_JZ1-9_nsteps10
 sigma: 0.0001
-n_steps: 25
+n_steps: 10
 train_type: particle
 flow_type: rcfm
 model_type: knn
 use_knn: false
 
-num_epochs: 500
+num_epochs: 100
 learningrate: 3e-5
 opt: lion
 loss_type: mse_and_direction
@@ -17,6 +17,7 @@ lr_scheduler_dict:
 
 use_swa: true
 check_val_every_n_epoch: 1
+val_sample_every_n_epoch: 1
 gradient_clip_val: 1.0
 train_class: true
 use_global: true
@@ -29,15 +30,15 @@ time_factor: 1000
 
 reduce_ds_train: -1
 reduce_ds_valid: -1
-eval_num_events: 10000
+eval_num_events: 5120
 
 entry_start_train: 0
 entry_start_valid: 0
 entry_start_test: 0
 
-num_workers: 6
+num_workers: 12
 batchsize: 128
-val_batchsize: 1000
+val_batchsize: 1024
 
 eval_dir: /storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/
 # truth_path_train: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/train_JZ3-6.root # 370k events
@@ -46,12 +47,14 @@ eval_dir: /storage/agrp/dreyet/f_delphes/cms-flow-evt/evals/
 # truth_path_train: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/train_JZ1-8.root # 1.3M events
 # truth_path_valid: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/val_JZ1-8.root   #  138k events
 # truth_path_test:  /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/test_JZ1-8.root  #  170k events
-truth_path_train: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/train_JZ7-8.root #  140k events
-truth_path_valid: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/val_JZ7-8.root   #  9500 events
-truth_path_test:  /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/test_JZ7-8.root  #  20k events
+# truth_path_train: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/train_JZ7-8.root #  140k events
+# truth_path_valid: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/val_JZ7-8.root   #  9500 events
+# truth_path_test:  /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS/test_JZ7-8.root  #  20k events
+truth_path_train: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS_mc23a_mc23e_train_val/train_mc23a_mc23e_JZ1-9.root
+truth_path_valid: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS_mc23a_mc23e_train_val/val_mc23a_mc23e_JZ1-9.root
+truth_path_test: /storage/agrp/dreyet/f_delphes/data/JZ_ATLAS_mc23e_FullSim/hamza_samples/test_JZ1-9.root
 
 max_particles: 500
-
 
 hidden_dim: 96
 global_dim: 14
@@ -67,7 +70,7 @@ mha_config:
     bias: false
     attn_type: torch-flex
 
-var_transform: !include var_transform_ttbar_qcd.yaml
+var_transform: !include var_transform_qcd_ATLAS.yaml
 
 truth_variables:
     - truth_pt
